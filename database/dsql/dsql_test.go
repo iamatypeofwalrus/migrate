@@ -45,6 +45,12 @@ func dsqlConnectionString(host, port string, options ...string) string {
 	return fmt.Sprintf("dsql://postgres:%s@%s:%s/postgres?%s", pgPassword, host, port, strings.Join(options, "&"))
 }
 
+func dsqlSpecificConnectionString(host, port string, options ...string) string {
+	options = append(options, "sslmode=disable")
+	options = append(options, fmt.Sprintf("password=%s", pgPassword))
+	return fmt.Sprintf("dsql://%s:%s/postgres?%s", host, port, strings.Join(options, "&"))
+}
+
 func isReady(ctx context.Context, c dktest.ContainerInfo) bool {
 	ip, port, err := c.FirstPort()
 	if err != nil {
@@ -433,17 +439,41 @@ func TestLockWorks(t *testing.T) {
 	})
 }
 
+func TestDSQLSpecificFormat(t *testing.T) {
+	dktesting.ParallelTest(t, specs, func(t *testing.T, c dktest.ContainerInfo) {
+		ip, port, err := c.FirstPort()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		addr := dsqlSpecificConnectionString(ip, port)
+		p := &DSQL{}
+		d, err := p.Open(addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := d.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		dt.Test(t, d, []byte("SELECT 1"))
+	})
+}
+
 func TestConnectionURLFormat(t *testing.T) {
 	testcases := []struct {
 		name            string
 		url             string
 		expectedOptions []string
 	}{
-		{name: "no params", url: "dsql://user:pass@host:5432/db", expectedOptions: []string{}},
-		{name: "one param", url: "dsql://user:pass@host:5432/db?sslmode=disable", expectedOptions: []string{}},
-		{name: "multiple params", url: "dsql://user:pass@host:5432/db?sslmode=disable&statement_timeout=60s", expectedOptions: []string{}},
-		{name: "one custom param", url: "dsql://user:pass@host:5432/db?x-migrations-table=my_migrations", expectedOptions: []string{"x-migrations-table"}},
-		{name: "multiple params with custom", url: "dsql://user:pass@host:5432/db?sslmode=disable&x-migrations-table=my_migrations", expectedOptions: []string{"x-migrations-table"}},
+		{name: "traditional: no params", url: "dsql://user:pass@host:5432/db", expectedOptions: []string{}},
+		{name: "traditional: one param", url: "dsql://user:pass@host:5432/db?sslmode=disable", expectedOptions: []string{}},
+		{name: "traditional: multiple params", url: "dsql://user:pass@host:5432/db?sslmode=disable&statement_timeout=60s", expectedOptions: []string{}},
+		{name: "traditional: custom param", url: "dsql://user:pass@host:5432/db?x-migrations-table=my_migrations", expectedOptions: []string{"x-migrations-table"}},
+		{name: "dsql-specific: basic", url: "dsql://host/db?password=secret", expectedOptions: []string{}},
+		{name: "dsql-specific: with params", url: "dsql://host/db?password=secret&x-migrations-table=my_migrations", expectedOptions: []string{"x-migrations-table"}},
+		{name: "dsql-specific: missing password", url: "dsql://host/db", expectedOptions: []string{"error"}},
 	}
 
 	for _, tc := range testcases {
@@ -452,6 +482,13 @@ func TestConnectionURLFormat(t *testing.T) {
 			d, err := p.Open(tc.url)
 
 			if len(tc.expectedOptions) > 0 {
+				if tc.expectedOptions[0] == "error" {
+					// Expect an error for missing password
+					if err == nil {
+						t.Error("expected error for missing password but got nil")
+					}
+					return
+				}
 				// For cases where we expect errors (custom options), just check that an error occurred
 				// We can't determine the specific error without connecting, which would fail anyway
 				t.Logf("URL parsing test for %s completed", tc.name)

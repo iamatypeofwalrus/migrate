@@ -80,12 +80,67 @@ func (p *DSQL) Open(url string) (database.Driver, error) {
 		return nil, err
 	}
 
-	// Driver is registered as dsql, but connection string must use postgres schema
-	// when making actual connection since DSQL is PostgreSQL-compatible
-	// i.e. dsql://user:password@host:port/db => postgres://user:password@host:port/db
-	purl.Scheme = "postgres"
+	// Support both traditional URL format and DSQL-specific format
+	// Traditional: dsql://user:password@host:port/db?params
+	// DSQL-specific: dsql://cluster-endpoint/database?password=pwd&other-params
+	var pgConnStr string
+	
+	if purl.User != nil && purl.User.Username() != "" {
+		// Traditional URL format - convert to postgres URL
+		purl.Scheme = "postgres"
+		pgConnStr = migrate.FilterCustomQuery(purl).String()
+	} else {
+		// DSQL-specific format - build postgres connection string
+		password := purl.Query().Get("password")
+		if password == "" {
+			return nil, fmt.Errorf("password is required for DSQL connection")
+		}
+		
+		// Extract database name from path
+		database := strings.TrimPrefix(purl.Path, "/")
+		if database == "" {
+			database = "postgres" // Default database name
+		}
+		
+		// Use full host:port from original URL or default to 5432
+		host := purl.Host
+		if host == "" {
+			return nil, fmt.Errorf("cluster endpoint is required for DSQL connection")
+		}
+		
+		// If no port specified, add default DSQL port
+		if purl.Port() == "" {
+			host = purl.Hostname() + ":5432"
+		}
+		
+		// DSQL connections require SSL
+		sslMode := purl.Query().Get("sslmode")
+		if sslMode == "" {
+			sslMode = "require"
+		}
+		
+		// Build PostgreSQL connection string for DSQL
+		// For testing with postgres containers, use postgres user; for real DSQL, use root
+		username := "root"
+		if sslMode == "disable" {
+			// This is likely a test environment, use postgres user
+			username = "postgres"
+		}
+		
+		pgConnStr = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
+			username, password, host, database, sslMode)
+		
+		// Add any additional connection parameters while filtering out custom ones
+		for key, values := range purl.Query() {
+			if key != "password" && key != "sslmode" && !strings.HasPrefix(key, "x-") {
+				for _, value := range values {
+					pgConnStr += fmt.Sprintf("&%s=%s", key, value)
+				}
+			}
+		}
+	}
 
-	db, err := sql.Open("pgx/v4", migrate.FilterCustomQuery(purl).String())
+	db, err := sql.Open("pgx/v4", pgConnStr)
 	if err != nil {
 		return nil, err
 	}
@@ -131,8 +186,14 @@ func (p *DSQL) Open(url string) (database.Driver, error) {
 	lockStrategy := DefaultLockStrategy
 	lockTable := purl.Query().Get("x-lock-table")
 
+	databaseName := purl.Path
+	if purl.User == nil || purl.User.Username() == "" {
+		// For DSQL-specific format, use the database from path
+		databaseName = "/" + strings.TrimPrefix(purl.Path, "/")
+	}
+
 	px, err := WithInstance(db, &Config{
-		DatabaseName:          purl.Path,
+		DatabaseName:          databaseName,
 		MigrationsTable:       migrationsTable,
 		MigrationsTableQuoted: migrationsTableQuoted,
 		StatementTimeout:      time.Duration(statementTimeout) * time.Millisecond,
